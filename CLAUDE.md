@@ -60,7 +60,7 @@ cafe-qr/            ← este repo: CLAUDE.md, docs/ y .claude/ (agentes y comand
 
 - API: NestJS + TypeScript.
 - Web (cliente, panel del local, barra y caja): React + TypeScript, como PWA.
-- Base: PostgreSQL. Mismo TypeORM y convenciones que Kiosco SaaS.
+- Base: PostgreSQL con Prisma 7 (mismo ORM y convenciones que Kiosco SaaS).
 - Docker para el entorno local y para la base de los tests de integración.
 
 ## Calidad
