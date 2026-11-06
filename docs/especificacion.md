@@ -32,7 +32,7 @@ Una persona puede tener varios roles: en un café chico, el mozo suele cobrar ta
 
 El cliente hace todo desde un link que abre el QR de su mesa. Todos los celulares que escanean la misma mesa comparten una **sesión de mesa**: un solo pedido abierto y una sola cuenta.
 
-1. **Escanea el QR.** El QR lleva el código de la mesa (por ejemplo `cafe.com/m/A7K2`). Se abre la carta con "Mesa 4" arriba y, si no hay sesión abierta, se crea una.
+1. **Escanea el QR.** El QR lleva el código de la mesa (por ejemplo `cafe.com/m/A7K2M9QX`; formato en "Reglas confirmadas", regla 7). Se abre la carta con "Mesa 4" arriba y, si no hay sesión abierta, se crea una.
 2. **Ve la carta.** Categorías (cafés, desayunos, tortas, salados), foto, precio, descripción y opciones del producto (tamaño, tipo de leche, extra shot). Lo agotado aparece gris. Si el cliente inició sesión, cada producto muestra cuántos puntos suma.
 3. **Arma el pedido y lo envía.** Agrega productos al carrito, con nota opcional ("sin azúcar"), y toca "Enviar pedido". Puede mandar varios pedidos en la misma visita; todos se suman a la cuenta de la mesa.
 4. **Sigue el estado.** Recibido → en preparación → listo → entregado, actualizado en vivo.
@@ -314,6 +314,146 @@ El club de puntos conviene hacerlo como módulo compartido entre el maxikiosco y
 3. **Amigos y marketing.** Código y QR de amigo, solicitudes, transferencia con PIN, límites, reporte para el admin, invitaciones con puntos, regalos periódicos, campañas y sorteos.
 4. **Mercado Pago en la caja.** QR con el monto exacto y acreditación automática. Pagar desde la mesa queda para más adelante.
 5. **Extras.** Niveles, promos por horario, reportes de horas pico, stock por receta, varios idiomas, cocina separada si hace falta.
+
+## Reglas confirmadas
+
+Reglas de la etapa 1 que el usuario confirmó el 2026-11-05 y amplió el 2026-11-06, después de la migración inicial (`20261106021213_modelo_etapa_1`). Prevalecen sobre cualquier texto anterior de esta especificación que las contradiga. Los valores de enum van en mayúsculas en la base.
+
+### 1. Idempotencia del envío de pedidos
+
+*Confirmada el 2026-11-05. Complementa "Envío de pedidos con conexión inestable". ADR: ninguno (el modelo ya la soporta, ADR 0005).*
+
+- La clave de idempotencia es única **por local**.
+- Misma clave + misma sesión + mismo payload (se compara el hash del payload): se devuelve el pedido original con **200**, sin crear otro.
+- Clave que ya existe con **otra sesión** o con **otro payload**: **409 `CLAVE_IDEMPOTENCIA_REUTILIZADA`**, sin ningún dato del otro pedido.
+- Ante el 409, la web muestra "No se pudo enviar, reintentá" y genera una clave nueva.
+
+### 2. Contramovimientos de pagos
+
+*Confirmada el 2026-11-05. ADR 0006 (complementa al ADR 0004).*
+
+La columna que referencia al pago anulado es `anula_a_id` (ADR 0004), el `anula_pago_id` de la regla.
+
+- `anula_a_id` es obligatorio en un contramovimiento y apunta a un pago del **mismo local** y de la **misma sesión**.
+- Se permiten **anulaciones parciales**. La suma de las anulaciones de un pago no supera su monto; la propina se controla por separado (la suma de las propinas anuladas no supera la propina del pago).
+- Un contramovimiento **no se puede anular**. Si fue un error, se registra un pago nuevo.
+- El contramovimiento usa el **mismo medio de pago** que el original.
+- Se imputa al **turno abierto actual**, no al del pago original.
+- Lo registra un **cajero o el encargado**, siempre con motivo (código y comentario, regla 8). *Ajustado el 2026-11-06:* si la sesión del pago está cerrada, ver "Anular un pago de una sesión cerrada" abajo.
+- En la base: signo del monto, FK y "el pago anulado no es un contramovimiento". En el servicio: el tope de la suma, con `SELECT … FOR UPDATE` sobre el pago original.
+
+**Anular solo la propina** (*confirmada el 2026-11-06*):
+
+- Se puede anular solo la propina: contramovimiento con `monto = 0` y `propina` negativa. Al menos uno de los dos tiene que ser distinto de cero (los dos son ≤ 0).
+- Se refleja en el reporte de propinas del **mes de la anulación**.
+
+**Anular un pago de una sesión cerrada** (*confirmada el 2026-11-06*):
+
+- La sesión **no se reabre**.
+- El contramovimiento queda ligado a la **sesión original** y se imputa al **turno actual**.
+- Error de medio de pago: se registra un **pago de corrección** en la misma sesión cerrada.
+- Devolución al cliente: solo el contramovimiento.
+- **Permisos:** lo hace el **encargado**; si el turno del pago original ya cerró, **solo el dueño**. Esto reemplaza, para pagos de sesiones cerradas, el "cajero o encargado" de arriba; con la sesión abierta sigue valiendo "cajero o encargado".
+- Si el pago estaba facturado, la anulación va con **nota de crédito** y el pago de corrección lleva su propia factura. *Dependencia:* comprobantes ARCA, pospuestos (ADR 0005, P6); no se diseña ahora.
+- En la etapa 2, si el pago sumó puntos, se descuentan **en proporción**. *Dependencia:* módulo puntos (etapa 2); no se diseña ahora.
+
+### 3. Opciones de producto al crear el pedido
+
+*Confirmada el 2026-11-05. Complementa P11 del ADR 0005.*
+
+- El servicio valida que cada opción elegida pertenezca a un grupo del producto del ítem y esté disponible, y respeta el mínimo y el máximo de cada grupo y los grupos obligatorios.
+- El precio lo recalcula el servidor: se ignora el que manda el cliente y se copia al ítem el precio de cada opción.
+- En la base: FK compuesta `(producto_id, opcion_id)` en las opciones del ítem (`pedido_item_opciones`). Nada de triggers para mínimos y máximos: eso lo valida el servicio.
+
+### 4. Quién cargó el pedido
+
+*Confirmada el 2026-11-05. ADR: ninguno.*
+
+- Todo pedido con origen distinto de `QR` (`MOZO` o `MOSTRADOR`) exige `cargado_por`, con CHECK en la base.
+- Los pedidos de origen `QR` quedan identificados por dispositivo y clave de idempotencia.
+
+### 5. Cierre de la sesión de mesa
+
+*Confirmada el 2026-11-05. ADR: ninguno (complementa P10 del ADR 0005).*
+
+- `motivo_cierre` es obligatorio al cerrar: `PAGO`, `ABANDONO`, `MANUAL` o `AUTOMATICO`.
+- `cerrada_por` es obligatorio salvo con motivo `AUTOMATICO`.
+- Con `PAGO`, `cerrada_por` es quien registró el pago final.
+- `ABANDONO` y `MANUAL`: solo el encargado, con motivo (código y comentario, regla 8). El saldo pendiente queda registrado como pérdida.
+
+**Pérdidas** (*confirmada el 2026-11-06*):
+
+- Tabla `perdidas` ligada al turno: `sesion_id`, `turno_id`, `monto`, `codigo_motivo`, `comentario`, `registrada_por`, `creada_en`.
+- Se registra al cerrar una sesión por `ABANDONO` o `MANUAL` **con saldo pendiente**.
+- Es **inmutable**.
+- Aparece en el resumen del turno y **no afecta el arqueo de efectivo**.
+
+### 6. Pedir la cuenta y estado de la mesa
+
+*Confirmada el 2026-11-05. ADR 0007.*
+
+- El **estado de la sesión** es la fuente de verdad; el llamado de tipo `CUENTA` es solo el aviso para la caja.
+- Pedir la cuenta es **una transacción** que pone la sesión en `CUENTA_PEDIDA` y crea el llamado.
+- Atender el llamado **no cambia** el estado de la sesión; solo el pago la cierra.
+- Color de la mesa, por prioridad: **rojo** (llamado al mozo pendiente) > **amarillo** (`CUENTA_PEDIDA`) > **ocupada** > **libre**.
+- Si llega un pedido nuevo después de pedir la cuenta, se acepta, la sesión vuelve a `ABIERTA` y la caja recibe un aviso de que la cuenta cambió.
+- *Confirmada el 2026-11-06:* cuando la sesión vuelve a `ABIERTA` por un pedido nuevo, el llamado de cuenta pendiente pasa **automáticamente** a `CANCELADO` (estado nuevo de los llamados). Si el cliente vuelve a pedir la cuenta, se crea un **llamado nuevo**.
+
+### 7. Código QR de la mesa
+
+*Confirmada el 2026-11-05. ADR: ninguno.*
+
+- 8 caracteres en **Crockford base32**: mayúsculas, sin I, L, O ni U (alfabeto `0123456789ABCDEFGHJKMNPQRSTVWXYZ`).
+- Generado con un generador criptográfico.
+- Único en **todo el sistema**, no por local.
+- La entrada se normaliza a mayúsculas antes de buscar.
+- Regenerar invalida el código anterior **al instante**; el código viejo muestra "Este QR ya no es válido, pedile al mozo".
+- Límite de consultas por IP en `/m/:codigo`.
+
+**QR desconocido** (*confirmada el 2026-11-06*):
+
+- Cualquier código que no corresponda a una mesa activa (inexistente, regenerado o de una mesa desactivada) recibe **la misma respuesta**, con el mismo código HTTP y el mensaje "Este QR ya no es válido, pedile al mozo".
+- **No se guardan** los códigos viejos.
+- *Propuesta para `docs/api/contratos.md` (tarea de salón):* `404` con código `QR_NO_VALIDO`, igual en los tres casos.
+
+**Token de sesión de mesa y expulsar dispositivo** (*confirmada el 2026-11-06*):
+
+- Regenerar el QR **no corta** a los dispositivos de una sesión abierta.
+- Al escanear, el dispositivo recibe un **token de sesión de mesa**, independiente del código QR, válido hasta que se cierra la sesión.
+- Se agrega la acción **"expulsar dispositivo"**, para el mozo o el encargado.
+
+### 8. Motivos codificados
+
+*Confirmada el 2026-11-06. ADR: ninguno.*
+
+- En todo lo que pide motivo (cierre de sesión por `ABANDONO` o `MANUAL`, anulación de ítems, contramovimientos y pérdidas) se guarda un `codigo_motivo` de una **lista fija** más un `comentario` opcional. El comentario es **obligatorio si el código es `OTRO`**.
+- Listas iniciales:
+  - Cierre de sesión: `SE_FUE_SIN_PAGAR`, `ERROR_DE_CARGA`, `MESA_DUPLICADA`, `OTRO`.
+  - Anulaciones y contramovimientos: `ERROR_DE_COBRO`, `PRODUCTO_MAL_HECHO`, `CLIENTE_ARREPENTIDO`, `OTRO`.
+
+### Cambios pendientes en el modelo
+
+Lo que hay que cambiar en `cafe-qr-api/prisma/schema.prisma` y en la migración `20261106021213_modelo_etapa_1` para cumplir estas reglas. La migración inicial todavía no está mergeada en `develop` (PR abierto, sin datos reales): los cambios se pueden hacer editando esa migración o con una migración nueva, y ninguno pierde datos reales. Igual se marcan con ⚠️ los que, aplicados como migración nueva, quitan o reemplazan algo existente.
+
+| # | Regla | Cambio | Tarea | Destructivo |
+| --- | --- | --- | --- | --- |
+| 1 | 4 | Reemplazar el CHECK `pedidos_mozo_con_carga` (`origen <> 'MOZO' OR cargado_por_id IS NOT NULL`) por `pedidos_no_qr_con_carga`: `origen = 'QR' OR cargado_por_id IS NOT NULL`. Actualizar el comentario `SQL:` de `Pedido`. | pedidos | ⚠️ Reemplaza un CHECK (sin datos: sin impacto) |
+| 2 | 1 | Ninguno en la base: `@@unique([localId, claveIdempotencia])` y `huella_solicitud` ya existen. Corregir el comentario de `huellaSolicitud` para decir que la huella es el hash del payload normalizado. La comparación de sesión y huella, y la carrera de dos envíos simultáneos con la misma clave (violación del único → releer y comparar), van en el servicio. | pedidos | No |
+| 3 | 5 | Nuevo enum `MotivoCierreSesion` (`PAGO`, `ABANDONO`, `MANUAL`, `AUTOMATICO`) y columna `sesiones_mesa.motivo_cierre` (nullable). Ampliar el CHECK `sesiones_mesa_cierre_completo` a `(estado = 'CERRADA') = (cerrada_en IS NOT NULL AND motivo_cierre IS NOT NULL)` y agregar `sesiones_mesa_cerrada_por`: `estado <> 'CERRADA' OR motivo_cierre = 'AUTOMATICO' OR cerrada_por_id IS NOT NULL`. Que `cerrada_por` sea quien registró el pago final y que `ABANDONO`/`MANUAL` sean solo del encargado se valida en el servicio. | salon | ⚠️ Reemplaza un CHECK (sin datos: sin impacto) |
+| 4 | 5 (pérdidas) | Tabla nueva `perdidas` (módulo caja, porque va ligada al turno): `id`, `local_id`, `sesion_id`, `turno_id`, `monto Decimal(14,2)`, `codigo_motivo` (enum `CodigoMotivoCierre`, el mismo de la sesión: *interpretación*, porque las pérdidas salen de un cierre), `comentario`, `registrada_por_id`, `creada_en`. FK compuestas `(local_id, sesion_id) → sesiones_mesa`, `(local_id, turno_id) → turnos_caja`, `(local_id, registrada_por_id) → usuarios`. CHECK `monto > 0`; CHECK comentario obligatorio con `OTRO`. *Propuesta:* único `(local_id, sesion_id)`, porque una sesión se cierra una sola vez. Inmutable como `pagos`: triggers `perdidas_inmutables` (UPDATE/DELETE) y `perdidas_sin_truncate` con la función existente `rechazar_cambio_inmutable`; los tests la vacían deshabilitando el de TRUNCATE, como con `pagos`. Solo `creada_en`, sin `actualizado_en` (ADR 0001). Salon la registra llamando al servicio de caja dentro de la transacción del cierre. El arqueo de efectivo no la suma. | caja / salon | No (tabla nueva) |
+| 5 | 3 | Agregar `producto_id` a `opciones_producto` con FK `(local_id, producto_id, grupo_id) → grupos_opciones(local_id, producto_id, id)` (requiere único `grupos_opciones(local_id, producto_id, id)`), y único `opciones_producto(local_id, producto_id, id)`. Así la opción no puede quedar en un producto distinto del de su grupo. | carta | No (columna nueva NOT NULL: sin datos, sin impacto) |
+| 6 | 3 | Agregar `producto_id` a `pedido_item_opciones`; reemplazar la FK `(local_id, opcion_id) → opciones_producto` por `(local_id, producto_id, opcion_id) → opciones_producto(local_id, producto_id, id)`, y la FK `(local_id, pedido_item_id) → pedido_items` por `(local_id, pedido_item_id, producto_id) → pedido_items(local_id, id, producto_id)` (requiere único `pedido_items(local_id, id, producto_id)`), para que la opción sea del mismo producto que el ítem. | pedidos | ⚠️ Reemplaza dos FK (sin datos: sin impacto) |
+| 7 | 2 | Contramovimientos (detalle en ADR 0006): quitar el único `pagos_local_id_anula_a_id_key` (impide las anulaciones parciales); reemplazar la FK `(local_id, anula_a_id) → pagos(local_id, id)` por la FK compuesta de ADR 0006 (misma sesión, mismo medio, el anulado no es contramovimiento), con sus columnas auxiliares, CHECKs y el único de destino; agregar índice `(local_id, anula_a_id)` no único para sumar las anulaciones; actualizar los comentarios de `Pago` ("Un pago se anula una sola vez" deja de valer). | caja | ⚠️ Quita un índice único y reemplaza una FK (sin datos: sin impacto) |
+| 8 | 2 | Permiso para `SELECT … FOR UPDATE` sobre `pagos` (PostgreSQL exige privilegio `UPDATE` en al menos una columna; ver ADR 0006). | caja | No |
+| 9 | 7 | CHECK `mesas_codigo_qr_formato`: `codigo_qr ~ '^[0-9A-HJKMNP-TV-Z]{8}$'`; achicar `codigo_qr` a `VarChar(8)`. El único global (`mesas_codigo_qr_key`) ya existe. | salon | ⚠️ Cambia el tipo de una columna (sin datos: sin impacto) |
+| 10 | 7 | Límite de consultas por IP en `/m/:codigo`: no es de la base; va en la API (throttler de NestJS sobre esa ruta). Si la API corre en más de una instancia, el contador tiene que ser compartido. | salon | No |
+| 11 | 6 | `CUENTA_PEDIDA` y el único de llamado pendiente por tipo ya existen. La transacción de pedir la cuenta y la vuelta a `ABIERTA` van en los servicios (ADR 0007). Para el llamado `CANCELADO`, ver la fila 14. | salon / pedidos | No |
+| 12 | 8 | Motivos codificados. Dos enums nuevos: `CodigoMotivoCierre` (`SE_FUE_SIN_PAGAR`, `ERROR_DE_CARGA`, `MESA_DUPLICADA`, `OTRO`) y `CodigoMotivoAnulacion` (`ERROR_DE_COBRO`, `PRODUCTO_MAL_HECHO`, `CLIENTE_ARREPENTIDO`, `OTRO`). Reemplazar `motivo_anulacion` por `codigo_motivo` + `comentario VarChar(200)` en `pedidos`, `pedido_items` y `pagos` (enum `CodigoMotivoAnulacion`), y agregarlos a `sesiones_mesa` (enum `CodigoMotivoCierre`). En cada tabla, CHECK `<tabla>_comentario_si_otro`: `codigo_motivo IS DISTINCT FROM 'OTRO' OR (comentario IS NOT NULL AND btrim(comentario) <> '')`. Ajustar los CHECKs que hoy usan `motivo_anulacion`: `pedidos_anulacion_completa`, `pedido_items_anulacion_completa` y `pagos_normal_o_contramovimiento` (pago normal sin código ni comentario; contramovimiento con código). En `sesiones_mesa`: CHECK `(motivo_cierre IN ('ABANDONO','MANUAL')) IS NOT DISTINCT FROM (codigo_motivo IS NOT NULL)`, para que el código vaya solo con esos dos motivos (sin cerrar, `motivo_cierre` es nulo y el código también). | pedidos / caja / salon | ⚠️ Quita la columna `motivo_anulacion` de tres tablas y reemplaza tres CHECK (sin datos: sin impacto) |
+| 13 | 2 (propina) | Ajustar el CHECK de contramovimiento de `pagos_normal_o_contramovimiento` a `anula_a_id IS NOT NULL AND monto <= 0 AND propina <= 0 AND (monto < 0 OR propina < 0) AND codigo_motivo IS NOT NULL`. El pago normal queda igual (`monto > 0`, `propina >= 0`). | caja | ⚠️ Reemplaza un CHECK (sin datos: sin impacto) |
+| 14 | 6 (llamado cancelado) | Agregar `CANCELADO` a `EstadoLlamado` y la columna `cancelado_en timestamptz` nullable. CHECK nuevo `llamados_cancelacion_completa`: `(estado = 'CANCELADO') = (cancelado_en IS NOT NULL)`. `llamados_atencion_completa` no cambia: con `CANCELADO` los dos lados dan falso. El índice único parcial `llamados_uno_pendiente_por_tipo` (`WHERE estado = 'PENDIENTE'`) tampoco cambia: un llamado cancelado sale del índice, así que se puede crear uno nuevo. *Propuesta:* CHECK `estado <> 'CANCELADO' OR tipo = 'CUENTA'`, porque la regla solo cancela llamados de cuenta. | salon | No (agrega un valor de enum y una columna) |
+| 15 | 7 (token) | Tabla nueva `dispositivos_sesion` (salon), editable: `id`, `local_id`, `sesion_id`, `token_hash` (SHA-256 de un token aleatorio de al menos 256 bits, generado con un generador criptográfico; el token en claro se le da una sola vez al dispositivo y **nunca se guarda**), `creado_en`, `expulsado_en`, `expulsado_por_id`. Único global `token_hash` (la búsqueda por token, como la del QR, no lleva el local). FK `(local_id, sesion_id) → sesiones_mesa` y `(local_id, expulsado_por_id) → usuarios`. CHECK `(expulsado_en IS NULL) = (expulsado_por_id IS NULL)`. Único `(local_id, sesion_id, id)` para la FK de pedidos. El token es válido si existe, no está expulsado y su sesión no está `CERRADA`; el `local_id` y la sesión de cada request del cliente salen de ahí. "Expulsar dispositivo": endpoint para mozo o encargado. *Propuesta:* `pedidos.dispositivo_id` con FK `(local_id, sesion_id, dispositivo_id) → dispositivos_sesion(local_id, sesion_id, id)` y CHECK `origen <> 'QR' OR dispositivo_id IS NOT NULL` (la regla 4 dice que los pedidos por QR se identifican por dispositivo). Al expulsar, tiempo-real desconecta ese dispositivo de la sala de la mesa. | salon / pedidos | No (tabla y columna nuevas) |
+| 16 | 2 (sesión cerrada) | Pago de corrección en una sesión cerrada: **el modelo actual ya lo permite**, porque la FK `pagos → sesiones_mesa` no mira el estado y es un pago normal. Va en el servicio de caja: un caso de uso propio (el cobro común exige sesión abierta), con los permisos de la regla 2 (encargado; dueño si el turno del pago original cerró). *Propuesta:* contramovimiento y pago de corrección en una sola transacción. Si los reportes tienen que distinguir un pago de corrección de un cobro común, haría falta una referencia; hoy la regla no lo pide y no se agrega. | caja | No |
+| 17 | 7 (QR desconocido) | Nada en la base (no se guardan códigos viejos). La API busca `codigo_qr` normalizado **y** `activa = true`; si no hay, responde `404 QR_NO_VALIDO` (*propuesta* para `docs/api/contratos.md`, tarea de salón), con el mismo cuerpo en los tres casos. | salon | No |
 
 ## Decisiones tomadas
 
